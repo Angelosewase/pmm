@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+      - "9090:9090"  # Prometheus metrics
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - API_KEY=${API_KEY}
+      - SECRET_KEY=${SECRET_KEY}
+      - LOG_LEVEL=INFO
+    depends_on:
+      - redis
+      - prometheus
+    networks:
+      - maintenance-net
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - maintenance-net
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - maintenance-net
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - maintenance-net
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  maintenance-net:
+    driver: bridge 
