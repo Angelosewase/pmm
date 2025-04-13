@@ -15,6 +15,13 @@ from app.preprocessing.data_processor import DataProcessor
 from app.models.ml_model import MaintenanceModel
 import numpy as np
 
+# Custom JSON encoder to handle datetime objects
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -100,6 +107,11 @@ class BatchPredictionResponse(BaseModel):
     batch_id: str
     summary: Dict[str, Any]
 
+class TrainingResponse(BaseModel):
+    message: str
+    status: str
+    timestamp: datetime
+
 # API key dependency
 async def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key != local_settings.API_KEY:
@@ -144,115 +156,174 @@ async def health_check():
             content={"status": "error", "message": str(e)}
         )
 
-@app.post("/train", dependencies=[Depends(verify_api_key)])
-async def train_model(background_tasks: BackgroundTasks):
-    """Train the model with current data."""
+def train_model_task():
+    """Background task to train the model."""
     try:
-        # Define a background task for training
-        def train_model_task():
-            try:
-                # Load and preprocess data
-                df = data_processor.load_data()
-                processed_df = data_processor.preprocess_data(df)
-                
-                # Split data
-                X_train, X_test, y_train, y_test = data_processor.split_data(processed_df)
-                
-                # Train model
-                model.train(X_train, y_train)
-                
-                # Evaluate model
-                metrics = model.evaluate(X_test, y_test)
-                
-                logger.info(f"Model training completed with metrics: {metrics}")
-                return metrics
-            except Exception as e:
-                logger.error(f"Error in model training task: {str(e)}")
-                raise
+        # Initialize components
+        data_processor = DataProcessor(local_settings.DATA_PATH)
+        model = MaintenanceModel(local_settings.MODEL_PATH)
         
-        # Add task to background tasks
+        # Load and preprocess data
+        logger.info("Loading and preprocessing data...")
+        df = data_processor.load_data()
+        if df is None or df.empty:
+            raise ValueError("Failed to load training data")
+            
+        # Verify required columns
+        required_columns = data_processor.feature_columns + [data_processor.target_column]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"Missing required columns: {missing_columns}")
+            
+        # Check for sufficient data
+        if len(df) < 100:  # Minimum required samples
+            raise ValueError(f"Insufficient training data: {len(df)} samples (minimum 100 required)")
+            
+        # Check class balance
+        class_counts = df[data_processor.target_column].value_counts()
+        min_class_count = class_counts.min()
+        if min_class_count < 10:  # Minimum samples per class
+            raise ValueError(f"Insufficient samples for class {class_counts.idxmin()}: {min_class_count} (minimum 10 required)")
+            
+        # Preprocess data
+        processed_df = data_processor.preprocess_data(df)
+        if processed_df is None:
+            raise ValueError("Data preprocessing failed")
+            
+        # Split data
+        X_train, X_test, y_train, y_test = data_processor.split_data(processed_df)
+        
+        # Train model
+        logger.info("Training model...")
+        model.train(X_train, y_train)
+        
+        # Evaluate model
+        metrics = model.evaluate(X_test, y_test)
+        
+        # Validate metrics
+        if metrics['accuracy'] < 0.5:
+            logger.warning(f"Model performance below random chance (accuracy: {metrics['accuracy']:.3f})")
+        
+        if metrics['roc_auc'] < 0.5:
+            logger.warning(f"Model ROC AUC below random chance (ROC AUC: {metrics['roc_auc']:.3f})")
+            
+        # Save feature importance
+        feature_importance = model.feature_importance()
+        if feature_importance:
+            logger.info(f"Top features by importance: {dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)[:5])}")
+        
+        return metrics
+        
+    except ValueError as ve:
+        logger.error(f"Validation error in model training: {str(ve)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error in model training task: {str(e)}")
+        raise
+
+@app.post("/train", response_model=TrainingResponse, dependencies=[Depends(verify_api_key)])
+async def train_model(background_tasks: BackgroundTasks) -> TrainingResponse:
+    """Train the maintenance prediction model."""
+    try:
+        # Add training task to background tasks
         background_tasks.add_task(train_model_task)
         
-        return {
-            "status": "training_started",
-            "message": "Model training has been started in the background",
-            "timestamp": datetime.now().isoformat()
-        }
+        return TrainingResponse(
+            message="Model training started in background",
+            status="success",
+            timestamp=datetime.now().isoformat()
+        )
+        
     except Exception as e:
-        logger.error(f"Error starting model training: {str(e)}")
-        return JSONResponse(
+        logger.error(f"Error initiating model training: {str(e)}")
+        raise HTTPException(
             status_code=500,
-            content=ErrorResponse(
-                detail=str(e),
-                timestamp=datetime.now(),
-                error_code="TRAINING_ERROR"
-            ).dict()
+            detail=f"Failed to start model training: {str(e)}"
         )
 
 @app.post("/predict", response_model=PredictionResponse, dependencies=[Depends(verify_api_key)])
-async def predict(input_data: PredictionInput):
-    """Make predictions for new data."""
+async def predict(input_data: PredictionInput) -> PredictionResponse:
+    """Make predictions for input data."""
     try:
-        start_time = time.time()
+        # Convert input data to dictionary and validate
+        data_dict = input_data.dict()
+        required_fields = {
+            'engine_rpm', 'lub_oil_pressure', 'fuel_pressure',
+            'coolant_pressure', 'lub_oil_temp', 'coolant_temp'
+        }
         
-        # Convert input to dict
-        input_dict = input_data.dict()
+        missing_fields = required_fields - set(data_dict.keys())
+        if missing_fields:
+            raise ValueError(f"Missing required fields: {missing_fields}")
         
-        # Generate cache key
-        cache_key = generate_cache_key(input_dict)
+        # Validate value ranges
+        valid_ranges = {
+            'engine_rpm': (300, 2000),
+            'lub_oil_pressure': (2.0, 6.0),
+            'fuel_pressure': (3.0, 20.0),
+            'coolant_pressure': (1.0, 4.0),
+            'lub_oil_temp': (70.0, 90.0),
+            'coolant_temp': (70.0, 90.0)
+        }
         
-        # Check cache
-        cached_result = cache.get(cache_key)
-        if cached_result:
-            logger.info(f"Cache hit for key: {cache_key}")
-            cached_result['timestamp'] = datetime.now()
-            return PredictionResponse(**cached_result)
+        for field, (min_val, max_val) in valid_ranges.items():
+            value = data_dict.get(field)
+            if value is not None and not (min_val <= float(value) <= max_val):
+                logger.warning(f"{field} value {value} outside valid range [{min_val}, {max_val}]")
         
-        # Prepare input data
-        X = data_processor.prepare_prediction_data(input_dict)
+        # Initialize components
+        data_processor = DataProcessor(local_settings.DATA_PATH)
+        model = MaintenanceModel(local_settings.MODEL_PATH)
         
-        # Ensure model is loaded
-        if model.model is None:
-            model.load_model()
-        
-        # Make prediction
-        predictions, probabilities = model.predict(X)
-        
-        # Get prediction and probability
-        prediction = int(predictions[0])
-        probability = float(probabilities[0][1])
-        
-        # Get feature importance
-        feature_importance = model.feature_importance()
-        
-        # Generate prediction ID
-        prediction_id = str(uuid.uuid4())
-        
-        # Prepare response
-        response = PredictionResponse(
-            prediction=prediction,
-            probability=probability,
-            status="Maintenance Required" if prediction == 1 else "Normal",
-            feature_importance=feature_importance,
-            prediction_id=prediction_id,
-            timestamp=datetime.now()
+        try:
+            # Prepare input data
+            processed_data = data_processor.prepare_prediction_data(data_dict)
+            
+            # Make prediction
+            predictions, probabilities = model.predict(processed_data)
+            
+            # Get prediction and probability
+            prediction = int(predictions[0])
+            probability = float(probabilities[0][1])  # Probability of positive class
+            
+            # Get feature importance
+            feature_importance = model.feature_importance()
+            
+            # Generate prediction ID
+            prediction_id = hashlib.md5(
+                f"{datetime.now().isoformat()}:{str(input_data.dict())}".encode()
+            ).hexdigest()
+
+            # Create response with all required fields
+            response = PredictionResponse(
+                prediction=prediction,
+                probability=probability,
+                status="Maintenance Required" if prediction == 1 else "Normal",
+                feature_importance=feature_importance,
+                prediction_id=prediction_id,
+                timestamp=datetime.now()
+            )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error in prediction processing: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error processing prediction: {str(e)}"
+            )
+            
+    except ValueError as ve:
+        logger.error(f"Validation error: {str(ve)}")
+        raise HTTPException(
+            status_code=400,
+            detail=str(ve)
         )
-        
-        # Store in cache
-        cache.set(cache_key, response.dict())
-        
-        logger.info(f"Prediction completed in {time.time() - start_time:.2f}s")
-        return response
-        
     except Exception as e:
         logger.error(f"Error in prediction endpoint: {str(e)}")
-        return JSONResponse(
+        raise HTTPException(
             status_code=500,
-            content=ErrorResponse(
-                detail=str(e),
-                timestamp=datetime.now(),
-                error_code="PREDICTION_ERROR"
-            ).dict()
+            detail=f"Internal server error: {str(e)}"
         )
 
 @app.post("/predict/batch", response_model=BatchPredictionResponse, dependencies=[Depends(verify_api_key)])
@@ -295,11 +366,11 @@ async def batch_predict(input_data: BatchPredictionInput):
         logger.error(f"Error in batch prediction endpoint: {str(e)}")
         return JSONResponse(
             status_code=500,
-            content=ErrorResponse(
+            content=json.dumps(ErrorResponse(
                 detail=str(e),
                 timestamp=datetime.now(),
                 error_code="BATCH_PREDICTION_ERROR"
-            ).dict()
+            ).dict(), cls=CustomJSONEncoder)
         )
 
 @app.get("/predictions/{prediction_id}")

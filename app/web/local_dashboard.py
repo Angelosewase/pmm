@@ -157,7 +157,7 @@ def update_prediction(n_clicks, engine_rpm, lub_oil_pressure, fuel_pressure,
         response = requests.post(
             "http://localhost:8000/predict",
             json=input_data,
-            headers={"X-API-Key": local_settings.API_KEY}
+            headers={"X-API-Key": "your-secret-api-key"}
         )
         
         if response.status_code == 200:

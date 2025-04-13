@@ -208,27 +208,61 @@ class MaintenanceModel:
             raise
     
     def predict(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Make predictions and return probabilities."""
+        """Make predictions and return probabilities with improved error handling."""
         try:
+            # Input validation
+            if not isinstance(X, np.ndarray):
+                raise ValueError("Input X must be a numpy array")
+            
+            if len(X.shape) != 2:
+                raise ValueError(f"Expected 2D array, got {len(X.shape)}D array")
+
+            # Load model if not loaded
             if self.model is None:
-                self.load_model()
+                try:
+                    self.load_model()
+                except Exception as e:
+                    raise ValueError(f"Failed to load model: {str(e)}")
+                    
                 if self.model is None:
                     raise ValueError("Model not trained yet and could not be loaded")
             
-            predictions = self.model.predict(X)
-            
-            # Get probability scores
-            if hasattr(self.model, 'predict_proba'):
-                probabilities = self.model.predict_proba(X)
-            else:
-                # If model doesn't support probability estimates, use a placeholder
-                probabilities = np.zeros((X.shape[0], 2))
-                probabilities[:, 1] = predictions
-            
-            return predictions, probabilities
+            try:
+                # Make predictions
+                predictions = self.model.predict(X)
+                
+                # Get probability scores
+                if hasattr(self.model, 'predict_proba'):
+                    probabilities = self.model.predict_proba(X)
+                else:
+                    # If model doesn't support probability estimates, use predictions
+                    probabilities = np.zeros((X.shape[0], 2))
+                    probabilities[:, 1] = predictions
+                    probabilities[:, 0] = 1 - predictions
+                    logger.warning("Model does not support probability estimates, using binary predictions")
+                
+                # Validate outputs
+                if not isinstance(predictions, np.ndarray):
+                    predictions = np.array(predictions)
+                if not isinstance(probabilities, np.ndarray):
+                    probabilities = np.array(probabilities)
+                
+                # Ensure binary classification predictions
+                if not np.all(np.isin(predictions, [0, 1])):
+                    logger.warning("Non-binary predictions detected, rounding to nearest integer")
+                    predictions = np.rint(predictions).astype(int)
+                
+                # Ensure valid probabilities
+                probabilities = np.clip(probabilities, 0, 1)
+                
+                return predictions, probabilities
+                
+            except Exception as e:
+                logger.error(f"Error during prediction: {str(e)}")
+                raise ValueError(f"Failed to make predictions: {str(e)}")
             
         except Exception as e:
-            logger.error(f"Error making predictions: {str(e)}")
+            logger.error(f"Error in predict method: {str(e)}")
             raise
     
     def load_model(self) -> None:
